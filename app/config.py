@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     scoring_cron_hour: int = 6
     database_path: str = "energy_risk.db"
     anthropic_model: str = "claude-opus-4-7"
-    scoring_batch_size: int = 10
+    scoring_batch_size: int = 5
 
 
 @lru_cache

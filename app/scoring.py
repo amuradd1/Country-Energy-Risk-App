@@ -19,13 +19,16 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from anthropic import Anthropic, APIError
+from anthropic import Anthropic, APIError, RateLimitError
 
 from . import database as db
 from .config import get_settings
 from .seed import COUNTRIES, EU_BASELINE, EU_COUNTRIES, PREWAVE_DIRECT
 
 logger = logging.getLogger(__name__)
+
+INTER_BATCH_SLEEP_SEC = 15.0
+WEB_SEARCH_MAX_USES = 3
 
 CONTEXT_DATE_HINT = (
     "The Strait of Hormuz has been effectively closed since February 28, 2026 due to the "
@@ -236,6 +239,26 @@ def _validate_url(url: Optional[str], allowed: set[str]) -> Optional[str]:
     return url if url in allowed else None
 
 
+def _parse_retry_after(exc: Exception) -> Optional[float]:
+    """Extract the retry-after header value from a 429 response, in seconds."""
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return None
+    headers = getattr(resp, "headers", None) or {}
+    raw = None
+    for key in ("retry-after", "Retry-After", "anthropic-ratelimit-input-tokens-reset"):
+        val = headers.get(key) if hasattr(headers, "get") else None
+        if val:
+            raw = val
+            break
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
 def _score_batch_with_retry(
     client: Anthropic,
     batch: list[tuple[str, str]],
@@ -258,7 +281,7 @@ def _score_batch_with_retry(
             message = client.messages.create(
                 model=settings.anthropic_model,
                 max_tokens=8192,
-                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
+                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": WEB_SEARCH_MAX_USES}],
                 messages=[{"role": "user", "content": prompt}],
             )
             text = _extract_text(message)
@@ -289,6 +312,15 @@ def _score_batch_with_retry(
                 time.sleep(2 ** attempt)
                 continue
             return rows, search_urls
+        except RateLimitError as e:
+            last_exc = e
+            wait = _parse_retry_after(e) or 60.0
+            wait = min(wait + 2.0, 120.0)  # buffer + cap
+            logger.warning(
+                "Rate limit 429 (attempt %d/%d) for %s — sleeping %.1fs per retry-after",
+                attempt + 1, max_retries, codes, wait,
+            )
+            time.sleep(wait)
         except APIError as e:
             last_exc = e
             wait = 2 ** attempt
@@ -427,12 +459,21 @@ def run_scoring(trigger_source: str = "scheduler") -> str:
         logger.warning("ANTHROPIC_API_KEY not set — using baselines only, no AI calls made")
 
     batch_size = max(1, settings.scoring_batch_size)
+    last_api_call_at = [0.0]  # monotonic seconds of the last call, for pacing
 
     def process(batches: list[list[tuple[str, str]]], mode: str) -> None:
         for batch in batches:
             ai_rows, search_urls = ([], [])
             if client is not None:
+                # Pace between calls: each batch spikes ~20-30k input tokens, which alone
+                # can saturate the 30k TPM default rate limit. Space calls out to stay under.
+                elapsed = time.monotonic() - last_api_call_at[0]
+                wait = INTER_BATCH_SLEEP_SEC - elapsed
+                if last_api_call_at[0] > 0 and wait > 0:
+                    logger.info("Pacing: sleeping %.1fs before next batch", wait)
+                    time.sleep(wait)
                 ai_rows, search_urls = _score_batch_with_retry(client, batch, mode, run_id)
+                last_api_call_at[0] = time.monotonic()
             by_code = {row.get("country_code"): row for row in ai_rows if row.get("country_code")}
             for code, name in batch:
                 results[code] = _merge_result(code, name, mode, by_code.get(code), search_urls)
