@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS risk_ratings (
     lng_status TEXT,
     key_risk TEXT,
     primary_source TEXT,
+    primary_source_url TEXT,
     secondary_sources TEXT,
+    source_urls TEXT,
     confidence TEXT CHECK(confidence IN ('High', 'Medium', 'Low')),
     hormuz_dependency TEXT,
     gdp_loss_pct REAL,
@@ -91,6 +93,10 @@ def get_conn() -> Iterator[sqlite3.Connection]:
 def init_db() -> None:
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(risk_ratings)").fetchall()}
+        for new_col in ("primary_source_url", "source_urls"):
+            if new_col not in cols:
+                conn.execute(f"ALTER TABLE risk_ratings ADD COLUMN {new_col} TEXT")
 
 
 def upsert_country(conn: sqlite3.Connection, code: str, name: str, region: str, prewave_mapped_to: Optional[str]) -> None:
@@ -136,20 +142,24 @@ def insert_rating(
     run_id: str,
     is_live: int = 1,
     is_pinned: int = 0,
+    primary_source_url: Optional[str] = None,
+    source_urls: Optional[str] = None,
 ) -> int:
     status_label = STATUS_LABELS[rating]
     cur = conn.execute(
         """
         INSERT INTO risk_ratings
           (country_code, rating, status_label, oil_reserve_days, lng_status, key_risk,
-           primary_source, secondary_sources, confidence, hormuz_dependency,
-           gdp_loss_pct, scoring_method, is_live, is_pinned, run_id, scored_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           primary_source, primary_source_url, secondary_sources, source_urls,
+           confidence, hormuz_dependency, gdp_loss_pct, scoring_method,
+           is_live, is_pinned, run_id, scored_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             country_code, rating, status_label, oil_reserve_days, lng_status, key_risk,
-            primary_source, secondary_sources, confidence, hormuz_dependency,
-            gdp_loss_pct, scoring_method, is_live, is_pinned, run_id, utcnow_iso(),
+            primary_source, primary_source_url, secondary_sources, source_urls,
+            confidence, hormuz_dependency, gdp_loss_pct, scoring_method,
+            is_live, is_pinned, run_id, utcnow_iso(),
         ),
     )
     return cur.lastrowid or 0

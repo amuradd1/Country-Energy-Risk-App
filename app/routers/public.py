@@ -33,7 +33,9 @@ CSV_FIELDS = [
     "lng_status",
     "key_risk",
     "primary_source",
+    "primary_source_url",
     "secondary_sources",
+    "source_urls",
     "confidence",
     "hormuz_dependency",
     "gdp_loss_pct",
@@ -41,6 +43,13 @@ CSV_FIELDS = [
     "is_pinned",
     "scored_at",
 ]
+
+
+def _split_urls(raw: Any) -> list[str] | None:
+    if not raw:
+        return None
+    parts = [u.strip() for u in str(raw).split(",") if u.strip()]
+    return parts or None
 
 
 def _to_record(row: dict[str, Any]) -> RatingRecord:
@@ -54,7 +63,9 @@ def _to_record(row: dict[str, Any]) -> RatingRecord:
         lng_status=row.get("lng_status"),
         key_risk=row.get("key_risk"),
         primary_source=row.get("primary_source"),
+        primary_source_url=row.get("primary_source_url"),
         secondary_sources=row.get("secondary_sources"),
+        source_urls=_split_urls(row.get("source_urls")),
         confidence=row.get("confidence"),
         hormuz_dependency=row.get("hormuz_dependency"),
         gdp_loss_pct=row.get("gdp_loss_pct"),
@@ -109,7 +120,9 @@ def get_ratings_csv() -> StreamingResponse:
                 "lng_status": rec.lng_status or "",
                 "key_risk": rec.key_risk or "",
                 "primary_source": rec.primary_source or "",
+                "primary_source_url": rec.primary_source_url or "",
                 "secondary_sources": rec.secondary_sources or "",
+                "source_urls": " | ".join(rec.source_urls) if rec.source_urls else "",
                 "confidence": rec.confidence or "",
                 "hormuz_dependency": rec.hormuz_dependency or "",
                 "gdp_loss_pct": rec.gdp_loss_pct if rec.gdp_loss_pct is not None else "",

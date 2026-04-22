@@ -13,7 +13,9 @@ class RatingRecord(BaseModel):
     lng_status: Optional[str] = None
     key_risk: Optional[str] = None
     primary_source: Optional[str] = None
+    primary_source_url: Optional[str] = None
     secondary_sources: Optional[str] = None
+    source_urls: Optional[list[str]] = None
     confidence: Optional[str] = None
     hormuz_dependency: Optional[str] = None
     gdp_loss_pct: Optional[float] = None

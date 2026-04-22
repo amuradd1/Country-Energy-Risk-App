@@ -1,14 +1,25 @@
-"""AI scoring engine. Uses Anthropic API with web_search tool to research each country."""
+"""AI scoring engine. Uses Anthropic API with web_search tool to research each country.
+
+Anti-hallucination design:
+- Every AI call uses the hosted web_search tool (no training-data-only answers).
+- The prompt forces the model to cite real source URLs per country.
+- We extract the actual URLs returned by web_search and validate that the model's
+  cited URLs appear in that pool. Fabricated URLs are dropped.
+- If web_search returns no results for a country, we mark confidence=Low and keep
+  the baseline/placeholder rather than inventing numbers.
+- Full raw response + URL pool are written to the scoring_log for every batch.
+"""
 from __future__ import annotations
 
 import json
 import logging
 import re
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from anthropic import Anthropic
+from anthropic import Anthropic, APIError
 
 from . import database as db
 from .config import get_settings
@@ -16,17 +27,35 @@ from .seed import COUNTRIES, EU_BASELINE, EU_COUNTRIES, PREWAVE_DIRECT
 
 logger = logging.getLogger(__name__)
 
-CONTEXT_DATE_HINT = "The Strait of Hormuz has been effectively closed since February 28, 2026 due to the US-Israel-Iran conflict. P&I insurance withdrawal (not military blockade) is the operative closure mechanism. IEA released 400mb from strategic reserves. Three commodity chains are in confirmed physical shortage: crude oil, LNG, naphtha."
+CONTEXT_DATE_HINT = (
+    "The Strait of Hormuz has been effectively closed since February 28, 2026 due to the "
+    "US-Israel-Iran conflict. P&I insurance withdrawal (not military blockade) is the "
+    "operative closure mechanism. IEA released 400mb from strategic reserves. Three "
+    "commodity chains are in confirmed physical shortage: crude oil, LNG, naphtha."
+)
+
+ANTI_HALLUCINATION_RULES = """
+CRITICAL — ANTI-HALLUCINATION RULES (non-negotiable):
+1. You MUST perform web searches before scoring ANY country. Do not rely on training data.
+2. Every numeric claim (oil_reserve_days, gdp_loss_pct) MUST be traceable to a web_search
+   result returned in this conversation. If you cannot verify from search, set the field
+   to null — DO NOT estimate.
+3. "primary_source_url" MUST be an actual URL returned by web_search in this conversation.
+   If you cite a URL that was not returned by search, your response will be rejected.
+4. If web_search returns no relevant results for a country, set:
+     confidence = "Low"
+     key_risk = "Insufficient fresh data — inheriting baseline"
+     primary_source_url = null
+   DO NOT invent reserve-day numbers, force majeure declarations, or emergency measures.
+5. Quote the source title in "primary_source" as it appears in the search result.
+"""
+
+
+def _label(rating: int) -> str:
+    return db.STATUS_LABELS.get(rating, "Stressed")
 
 
 def _build_prompt(today_iso: str, batch: list[tuple[str, str]], mode: str) -> str:
-    """Build the scoring prompt for a batch.
-
-    mode:
-      - "ai_researched": full web search
-      - "prewave_eu_mapped": anchored on EU baseline, AI adjusts +/-1
-      - "prewave_direct": anchored on Prewave direct value, AI validates
-    """
     if mode == "prewave_eu_mapped":
         anchor = (
             f"\nANCHOR: These countries inherit the Prewave EU/Germany baseline: "
@@ -34,8 +63,9 @@ def _build_prompt(today_iso: str, batch: list[tuple[str, str]], mode: str) -> st
             f"oil_reserve_days={EU_BASELINE['oil_reserve_days']}, "
             f"lng_status={EU_BASELINE['lng_status']}, "
             f"hormuz_dependency={EU_BASELINE['hormuz_dependency']}. "
-            "Adjust +/-1 ONLY if country-specific factors (energy mix, domestic production, landlocked, "
-            "storage levels, nuclear share, emergency measures) clearly warrant it."
+            "Adjust +/-1 ONLY if country-specific factors (energy mix, domestic production, "
+            "landlocked status, storage levels, nuclear share, emergency measures) clearly "
+            "warrant it, AND you have a cited source for that adjustment."
         )
     elif mode == "prewave_direct":
         direct_notes = []
@@ -49,8 +79,8 @@ def _build_prompt(today_iso: str, batch: list[tuple[str, str]], mode: str) -> st
                 )
         anchor = (
             "\nANCHOR: Prewave SITREP Day 33 provides DIRECT ratings for these countries. "
-            "Validate with current web search but stay within +/-1 of the Prewave value unless "
-            "overwhelming new evidence emerges.\n" + "\n".join(direct_notes)
+            "Validate with current web search but stay within +/-1 of the Prewave value "
+            "unless overwhelming new cited evidence emerges.\n" + "\n".join(direct_notes)
         )
     else:
         anchor = ""
@@ -60,8 +90,8 @@ def _build_prompt(today_iso: str, batch: list[tuple[str, str]], mode: str) -> st
     return f"""You are an energy security analyst assessing country-level energy risk as of {today_iso}.
 
 CONTEXT: {CONTEXT_DATE_HINT}
-
-For each country below, search for the LATEST information on:
+{ANTI_HALLUCINATION_RULES}
+For each country below, search the web for the LATEST information on:
 - Oil/fuel reserve levels (days of supply)
 - LNG/gas supply status
 - Any emergency measures (rationing, 4-day workweeks, school closures, price caps)
@@ -84,42 +114,71 @@ Respond ONLY with a valid JSON array, no markdown, no preamble, no trailing comm
 [{{
   "country_code": "XX",
   "rating": N,
-  "oil_reserve_days": N,
+  "oil_reserve_days": N or null,
   "lng_status": "one of: Exhausted/Depleted/Critical/Minimal/Low/Stressed/Partial/Managed/Buffered",
   "key_risk": "max 100 chars",
-  "primary_source": "source name",
-  "secondary_sources": "comma-separated",
+  "primary_source": "source title as shown in search result",
+  "primary_source_url": "https://... (MUST be from web_search results) or null",
+  "secondary_sources": "comma-separated titles",
   "confidence": "High/Medium/Low",
   "hormuz_dependency": "HIGH/CRIT/MOD/LOW/NONE"
 }}]
 """
 
 
-def _label(rating: int) -> str:
-    return db.STATUS_LABELS.get(rating, "Stressed")
-
-
 def _extract_text(message: Any) -> str:
     parts: list[str] = []
     for block in getattr(message, "content", []) or []:
-        block_type = getattr(block, "type", None)
-        if block_type == "text":
+        if getattr(block, "type", None) == "text":
             parts.append(getattr(block, "text", "") or "")
     return "\n".join(parts).strip()
 
 
+def _extract_search_urls(message: Any) -> list[dict[str, str]]:
+    """Pull every URL returned by the hosted web_search tool for this message.
+
+    Returns a deduped list of {url, title} dicts. Used to (a) validate that the
+    model's cited URLs are real, and (b) attach evidence to each country row.
+    """
+    sources: list[dict[str, str]] = []
+    for block in getattr(message, "content", []) or []:
+        block_type = getattr(block, "type", None)
+        if block_type in ("web_search_tool_result", "server_tool_result"):
+            content = getattr(block, "content", []) or []
+            for item in content:
+                if isinstance(item, dict):
+                    url = item.get("url") or ""
+                    title = item.get("title") or ""
+                else:
+                    url = getattr(item, "url", "") or ""
+                    title = getattr(item, "title", "") or ""
+                if url:
+                    sources.append({"url": url, "title": title})
+        if block_type == "text":
+            for cit in getattr(block, "citations", []) or []:
+                url = getattr(cit, "url", None) or (cit.get("url") if isinstance(cit, dict) else None)
+                title = getattr(cit, "title", None) or (cit.get("title") if isinstance(cit, dict) else None)
+                if url:
+                    sources.append({"url": url, "title": title or ""})
+
+    seen: set[str] = set()
+    unique: list[dict[str, str]] = []
+    for s in sources:
+        if s["url"] and s["url"] not in seen:
+            seen.add(s["url"])
+            unique.append(s)
+    return unique
+
+
 def _parse_json_array(text: str) -> list[dict[str, Any]]:
-    """Parse a JSON array out of a model response that may have wrapper markdown/prose."""
     if not text:
         return []
     cleaned = text.strip()
-    # Strip triple-backtick fences if present
-    fence_match = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", cleaned, re.DOTALL)
-    if fence_match:
-        cleaned = fence_match.group(1)
+    fence = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", cleaned, re.DOTALL)
+    if fence:
+        cleaned = fence.group(1)
     else:
-        start = cleaned.find("[")
-        end = cleaned.rfind("]")
+        start, end = cleaned.find("["), cleaned.rfind("]")
         if start != -1 and end != -1 and end > start:
             cleaned = cleaned[start : end + 1]
     try:
@@ -127,17 +186,14 @@ def _parse_json_array(text: str) -> list[dict[str, Any]]:
     except json.JSONDecodeError as e:
         logger.warning("JSON parse failed: %s", e)
         return []
-    if not isinstance(data, list):
-        return []
-    return [d for d in data if isinstance(d, dict)]
+    return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
 
 
 def _clamp_rating(r: Any) -> int:
     try:
-        n = int(r)
+        return max(1, min(5, int(r)))
     except (TypeError, ValueError):
         return 3
-    return max(1, min(5, n))
 
 
 def _clamp_reserve(v: Any) -> Optional[int]:
@@ -149,41 +205,68 @@ def _clamp_reserve(v: Any) -> Optional[int]:
         return None
 
 
-def _score_batch(
+def _validate_url(url: Optional[str], allowed: set[str]) -> Optional[str]:
+    """Only accept the model's cited URL if web_search actually returned it."""
+    if not url or not isinstance(url, str):
+        return None
+    url = url.strip()
+    return url if url in allowed else None
+
+
+def _score_batch_with_retry(
     client: Anthropic,
     batch: list[tuple[str, str]],
     mode: str,
     run_id: str,
-) -> list[dict[str, Any]]:
+    max_retries: int = 3,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Call Anthropic with retry + exponential backoff. Returns (parsed_rows, search_urls)."""
     settings = get_settings()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     prompt = _build_prompt(today, batch, mode)
 
-    try:
-        message = client.messages.create(
-            model=settings.anthropic_model,
-            max_tokens=4096,
-            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except Exception as e:
-        logger.exception("Anthropic API call failed for batch mode=%s", mode)
-        db.log_scoring(
-            run_id,
-            country_code=None,
-            raw_response=f"API_ERROR mode={mode} batch={[c for c, _ in batch]}: {e}",
-            queries=None,
-        )
-        return []
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_retries):
+        try:
+            message = client.messages.create(
+                model=settings.anthropic_model,
+                max_tokens=4096,
+                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = _extract_text(message)
+            search_urls = _extract_search_urls(message)
+            db.log_scoring(
+                run_id,
+                country_code=None,
+                raw_response=(
+                    f"mode={mode} batch={[c for c, _ in batch]} "
+                    f"attempt={attempt + 1} search_urls={len(search_urls)}\n{text}"
+                ),
+                queries=json.dumps([s["url"] for s in search_urls]),
+            )
+            rows = _parse_json_array(text)
+            return rows, search_urls
+        except APIError as e:
+            last_exc = e
+            wait = 2 ** attempt
+            logger.warning(
+                "Anthropic API error (attempt %d/%d): %s — retrying in %ds",
+                attempt + 1, max_retries, e, wait,
+            )
+            time.sleep(wait)
+        except Exception as e:
+            last_exc = e
+            logger.exception("Unexpected error in _score_batch")
+            break
 
-    text = _extract_text(message)
     db.log_scoring(
         run_id,
         country_code=None,
-        raw_response=f"mode={mode} batch={[c for c, _ in batch]}\n{text}",
+        raw_response=f"API_FAILED mode={mode} batch={[c for c, _ in batch]}: {last_exc}",
         queries=None,
     )
-    return _parse_json_array(text)
+    return [], []
 
 
 def _merge_result(
@@ -191,18 +274,24 @@ def _merge_result(
     name: str,
     mode: str,
     ai: Optional[dict[str, Any]],
+    search_urls: list[dict[str, str]],
 ) -> dict[str, Any]:
-    """Combine AI response with Prewave baseline fallbacks per scoring priority."""
+    allowed_urls = {s["url"] for s in search_urls}
+    url_pool = ",".join(s["url"] for s in search_urls[:10]) if search_urls else None
+
     if mode == "prewave_direct":
         base = dict(PREWAVE_DIRECT.get(code, {}))
-        rating = _clamp_rating(ai.get("rating")) if ai else base.get("rating", 3)
+        rating = _clamp_rating((ai or {}).get("rating")) if ai else base.get("rating", 3)
+        primary_url = _validate_url((ai or {}).get("primary_source_url"), allowed_urls)
         return {
             "rating": rating,
             "oil_reserve_days": _clamp_reserve((ai or {}).get("oil_reserve_days")) or base.get("oil_reserve_days"),
             "lng_status": (ai or {}).get("lng_status") or base.get("lng_status"),
             "key_risk": (ai or {}).get("key_risk") or base.get("key_risk"),
             "primary_source": (ai or {}).get("primary_source") or "Prewave SITREP Day 33",
+            "primary_source_url": primary_url,
             "secondary_sources": (ai or {}).get("secondary_sources"),
+            "source_urls": url_pool,
             "confidence": (ai or {}).get("confidence") or "High",
             "hormuz_dependency": (ai or {}).get("hormuz_dependency") or base.get("hormuz_dependency"),
             "gdp_loss_pct": base.get("gdp_loss_pct"),
@@ -212,44 +301,56 @@ def _merge_result(
     if mode == "prewave_eu_mapped":
         base = dict(EU_BASELINE)
         rating = _clamp_rating((ai or {}).get("rating") or base["rating"])
-        # clamp to baseline +/- 1
         anchor = base["rating"]
         rating = max(anchor - 1, min(anchor + 1, rating))
+        primary_url = _validate_url((ai or {}).get("primary_source_url"), allowed_urls)
         return {
             "rating": rating,
             "oil_reserve_days": _clamp_reserve((ai or {}).get("oil_reserve_days")) or base.get("oil_reserve_days"),
             "lng_status": (ai or {}).get("lng_status") or base.get("lng_status"),
             "key_risk": (ai or {}).get("key_risk") or base.get("key_risk"),
             "primary_source": (ai or {}).get("primary_source") or "Prewave SITREP Day 33 (EU baseline)",
+            "primary_source_url": primary_url,
             "secondary_sources": (ai or {}).get("secondary_sources"),
+            "source_urls": url_pool,
             "confidence": (ai or {}).get("confidence") or "Medium",
             "hormuz_dependency": (ai or {}).get("hormuz_dependency") or base.get("hormuz_dependency"),
             "gdp_loss_pct": base.get("gdp_loss_pct"),
             "scoring_method": "prewave_eu_mapped",
         }
 
-    # ai_researched — AI is authoritative; if missing, fall back to a neutral 3/Stressed
+    # ai_researched — AI is authoritative; on failure, mark Low confidence, don't invent numbers.
     if ai is None:
         return {
             "rating": 3,
             "oil_reserve_days": None,
             "lng_status": None,
-            "key_risk": f"AI scoring failed for {name}; awaiting retry.",
+            "key_risk": f"AI scoring failed for {name}; retry scheduled.",
             "primary_source": "Fallback (AI scoring failed)",
+            "primary_source_url": None,
             "secondary_sources": None,
+            "source_urls": url_pool,
             "confidence": "Low",
             "hormuz_dependency": None,
             "gdp_loss_pct": None,
             "scoring_method": "ai_researched",
         }
+
+    primary_url = _validate_url(ai.get("primary_source_url"), allowed_urls)
+    # If the model refused to provide a verifiable URL, cap confidence at Low — data is suspect.
+    confidence = ai.get("confidence") or "Medium"
+    if not primary_url and confidence == "High":
+        confidence = "Medium"
     return {
         "rating": _clamp_rating(ai.get("rating")),
         "oil_reserve_days": _clamp_reserve(ai.get("oil_reserve_days")),
         "lng_status": ai.get("lng_status"),
         "key_risk": (ai.get("key_risk") or "")[:200] or None,
         "primary_source": ai.get("primary_source") or "AI web search",
+        "primary_source_url": primary_url,
         "secondary_sources": ai.get("secondary_sources"),
-        "confidence": ai.get("confidence") or "Medium",
+        "source_urls": url_pool,
+        "confidence": confidence,
         "hormuz_dependency": ai.get("hormuz_dependency"),
         "gdp_loss_pct": None,
         "scoring_method": "ai_researched",
@@ -257,11 +358,11 @@ def _merge_result(
 
 
 def _chunks(seq: list, n: int) -> list[list]:
-    return [seq[i : i + n]] if n <= 0 else [seq[i : i + n] for i in range(0, len(seq), n)]
+    return [seq[i : i + n] for i in range(0, len(seq), max(1, n))]
 
 
 def run_scoring(trigger_source: str = "scheduler") -> str:
-    """Run full daily scoring pass. Atomically replaces live ratings on success."""
+    """Run a full daily scoring pass. Atomically replaces live ratings on success."""
     settings = get_settings()
     run_id = f"run-{uuid.uuid4().hex[:12]}"
     db.start_run(run_id, trigger_source=trigger_source)
@@ -269,8 +370,7 @@ def run_scoring(trigger_source: str = "scheduler") -> str:
     pinned = db.get_pinned_codes()
     name_by_code = {code: name for code, name, _ in COUNTRIES}
 
-    # Build batches by scoring mode, excluding pinned countries.
-    direct = [(c, name_by_code[c]) for c in PREWAVE_DIRECT if c not in pinned]
+    direct = [(c, name_by_code[c]) for c in PREWAVE_DIRECT if c in name_by_code and c not in pinned]
     eu = [(c, name_by_code[c]) for c in EU_COUNTRIES if c not in pinned]
     handled = set(PREWAVE_DIRECT.keys()) | set(EU_COUNTRIES)
     ai = [(c, n) for c, n, _ in COUNTRIES if c not in handled and c not in pinned]
@@ -281,24 +381,23 @@ def run_scoring(trigger_source: str = "scheduler") -> str:
     if settings.anthropic_api_key:
         client = Anthropic(api_key=settings.anthropic_api_key)
     else:
-        logger.warning("ANTHROPIC_API_KEY not set — skipping AI calls, using baselines only.")
+        logger.warning("ANTHROPIC_API_KEY not set — using baselines only, no AI calls made")
 
     batch_size = max(1, settings.scoring_batch_size)
 
     def process(batches: list[list[tuple[str, str]]], mode: str) -> None:
         for batch in batches:
-            ai_rows: list[dict[str, Any]] = []
+            ai_rows, search_urls = ([], [])
             if client is not None:
-                ai_rows = _score_batch(client, batch, mode, run_id)
+                ai_rows, search_urls = _score_batch_with_retry(client, batch, mode, run_id)
             by_code = {row.get("country_code"): row for row in ai_rows if row.get("country_code")}
             for code, name in batch:
-                results[code] = _merge_result(code, name, mode, by_code.get(code))
+                results[code] = _merge_result(code, name, mode, by_code.get(code), search_urls)
 
     process(_chunks(direct, batch_size), "prewave_direct")
     process(_chunks(eu, batch_size), "prewave_eu_mapped")
     process(_chunks(ai, batch_size), "ai_researched")
 
-    # Atomic swap: supersede non-pinned live rows, then insert the fresh batch.
     inserted = 0
     with db.get_conn() as conn:
         conn.execute("BEGIN")
@@ -313,7 +412,9 @@ def run_scoring(trigger_source: str = "scheduler") -> str:
                     lng_status=r["lng_status"],
                     key_risk=r["key_risk"],
                     primary_source=r["primary_source"],
+                    primary_source_url=r.get("primary_source_url"),
                     secondary_sources=r["secondary_sources"],
+                    source_urls=r.get("source_urls"),
                     confidence=r["confidence"],
                     hormuz_dependency=r["hormuz_dependency"],
                     gdp_loss_pct=r.get("gdp_loss_pct"),

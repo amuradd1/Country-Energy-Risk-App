@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Admin — Country Energy Risk Feed</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 24px; background: #f6f7f9; color: #1f2328; max-width: 1100px; margin: 0 auto; }
+  h1 { margin: 0 0 6px; font-size: 22px; }
+  h2 { font-size: 16px; margin: 0 0 10px; }
+  .sub { color: #6b7280; font-size: 13px; margin-bottom: 18px; }
+  .card { background: #fff; border-radius: 8px; padding: 16px; margin-bottom: 16px; box-shadow: 0 1px 2px rgba(0,0,0,.05); }
+  label { display: block; font-size: 12px; color: #4b5563; margin: 8px 0 4px; text-transform: uppercase; letter-spacing: .04em; }
+  input, select, textarea { padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; font-family: inherit; width: 100%; }
+  textarea { min-height: 60px; resize: vertical; }
+  button { background: #2563eb; color: #fff; border: 0; padding: 9px 14px; border-radius: 6px; font-size: 14px; font-weight: 500; cursor: pointer; }
+  button:hover { background: #1d4ed8; }
+  button.danger { background: #dc2626; }
+  button.danger:hover { background: #b91c1c; }
+  button.secondary { background: #6b7280; }
+  button.secondary:hover { background: #4b5563; }
+  .row { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 140px; }
+  .out { background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 6px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; white-space: pre-wrap; max-height: 300px; overflow: auto; }
+  .links { font-size: 13px; margin-bottom: 16px; }
+  .links a { color: #2563eb; text-decoration: none; margin-right: 14px; }
+  .warn { background: #fef3c7; color: #92400e; padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<h1>Admin — Energy Risk Feed</h1>
+<div class="links">
+  <a href="/">← Back to public view</a>
+  <a href="/docs">API docs</a>
+</div>
+
+<div class="warn">
+  The admin key is held only in this browser tab's memory. It is never stored on the server or in a cookie.
+  Paste it below to enable the controls; refreshing the page clears it.
+</div>
+
+<div class="card">
+  <h2>Admin key</h2>
+  <label for="key">X-Admin-Key</label>
+  <input type="password" id="key" placeholder="paste the admin key set in Railway">
+</div>
+
+<div class="card">
+  <h2>Trigger scoring run now</h2>
+  <p style="font-size:13px; color:#4b5563;">Runs the full AI pass immediately. Takes several minutes — all live (non-pinned) ratings are atomically replaced on success.</p>
+  <button onclick="triggerRefresh()">Run now</button>
+  <button class="secondary" onclick="loadHealth()">Check health</button>
+  <pre class="out" id="refresh-out" style="display:none;"></pre>
+</div>
+
+<div class="card">
+  <h2>Manual override</h2>
+  <div class="row">
+    <div><label>Country code (ISO-2)</label><input id="ov-code" placeholder="PK"></div>
+    <div><label>Rating 1–5</label><input id="ov-rating" type="number" min="1" max="5" value="3"></div>
+    <div><label>Confidence</label>
+      <select id="ov-conf"><option>High</option><option>Medium</option><option>Low</option></select>
+    </div>
+    <div><label>Pin?</label>
+      <select id="ov-pin"><option value="false">No — replaced by next run</option><option value="true">Yes — survives runs</option></select>
+    </div>
+  </div>
+  <div class="row">
+    <div><label>Oil reserve days</label><input id="ov-oil" type="number" placeholder="optional"></div>
+    <div><label>LNG status</label><input id="ov-lng" placeholder="optional"></div>
+    <div><label>Hormuz dependency</label>
+      <select id="ov-hormuz"><option value="">—</option><option>HIGH</option><option>CRIT</option><option>MOD</option><option>LOW</option><option>NONE</option></select>
+    </div>
+  </div>
+  <label>Key risk (what changed)</label>
+  <textarea id="ov-risk" placeholder="Manual override reason / new evidence"></textarea>
+  <div style="margin-top:10px;">
+    <button onclick="submitOverride()">Apply override</button>
+    <button class="secondary" onclick="unpin()">Unpin country</button>
+  </div>
+  <pre class="out" id="ov-out" style="display:none;"></pre>
+</div>
+
+<div class="card">
+  <h2>Audit log</h2>
+  <button class="secondary" onclick="loadLog()">Load latest 50 entries</button>
+  <button class="secondary" onclick="loadRuns()">List scoring runs</button>
+  <pre class="out" id="log-out" style="display:none;"></pre>
+</div>
+
+<div class="card">
+  <h2>Country history</h2>
+  <div class="row">
+    <div><label>Country code</label><input id="hist-code" placeholder="PK"></div>
+    <div><button onclick="loadHistory()">Load history</button></div>
+  </div>
+  <pre class="out" id="hist-out" style="display:none;"></pre>
+</div>
+
+<script>
+  function key() { return document.getElementById('key').value.trim(); }
+  function show(id, text) { const el = document.getElementById(id); el.style.display = 'block'; el.textContent = text; }
+  async function req(path, opts = {}) {
+    const headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
+    if (key()) headers['X-Admin-Key'] = key();
+    const res = await fetch(path, Object.assign({}, opts, { headers }));
+    const text = await res.text();
+    let body;
+    try { body = JSON.stringify(JSON.parse(text), null, 2); } catch { body = text; }
+    return `HTTP ${res.status}\n\n${body}`;
+  }
+  async function triggerRefresh() {
+    show('refresh-out', 'Running — this may take several minutes…');
+    show('refresh-out', await req('/admin/trigger-refresh', { method: 'POST' }));
+  }
+  async function loadHealth() {
+    show('refresh-out', await req('/api/v1/health'));
+  }
+  async function submitOverride() {
+    const body = {
+      country_code: document.getElementById('ov-code').value.trim().toUpperCase(),
+      rating: Number(document.getElementById('ov-rating').value),
+      confidence: document.getElementById('ov-conf').value,
+      pin: document.getElementById('ov-pin').value === 'true',
+      oil_reserve_days: Number(document.getElementById('ov-oil').value) || null,
+      lng_status: document.getElementById('ov-lng').value || null,
+      hormuz_dependency: document.getElementById('ov-hormuz').value || null,
+      key_risk: document.getElementById('ov-risk').value || null,
+    };
+    show('ov-out', await req('/admin/override', { method: 'POST', body: JSON.stringify(body) }));
+  }
+  async function unpin() {
+    const code = document.getElementById('ov-code').value.trim().toUpperCase();
+    show('ov-out', await req('/admin/unpin', { method: 'POST', body: JSON.stringify({ country_code: code }) }));
+  }
+  async function loadLog() {
+    show('log-out', await req('/admin/log?limit=50'));
+  }
+  async function loadRuns() {
+    show('log-out', await req('/admin/runs?limit=50'));
+  }
+  async function loadHistory() {
+    const code = document.getElementById('hist-code').value.trim().toUpperCase();
+    if (!code) { show('hist-out', 'Enter a country code'); return; }
+    show('hist-out', await req('/admin/history/' + code));
+  }
+</script>
+</body>
+</html>

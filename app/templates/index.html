@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Country Energy Risk Feed</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  * { box-sizing: border-box; }
+  body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 24px; background: #f6f7f9; color: #1f2328; }
+  h1 { margin: 0 0 6px; font-size: 22px; }
+  .sub { color: #6b7280; font-size: 13px; margin-bottom: 18px; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; background: #e5e7eb; color: #374151; margin-right: 6px; font-size: 12px; }
+  .pill.ok { background: #d1fae5; color: #065f46; }
+  .pill.warn { background: #fef3c7; color: #92400e; }
+  .pill.err { background: #fee2e2; color: #991b1b; }
+  .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
+  input[type=text] { padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; width: 320px; }
+  select { padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; background: #fff; }
+  .legend { display: flex; gap: 4px; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-weight: 600; color: #fff; min-width: 62px; text-align: center; font-size: 13px; }
+  .r1 { background: #16a34a; }
+  .r2 { background: #84cc16; }
+  .r3 { background: #f59e0b; color: #111827; }
+  .r4 { background: #ea580c; }
+  .r5 { background: #dc2626; }
+  .links { margin-left: auto; font-size: 13px; }
+  .links a { color: #2563eb; text-decoration: none; margin-left: 10px; }
+  .links a:hover { text-decoration: underline; }
+  table { width: 100%; border-collapse: collapse; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.05); border-radius: 8px; overflow: hidden; }
+  th { background: #f3f4f6; text-align: left; padding: 10px 12px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: #4b5563; font-weight: 600; cursor: pointer; user-select: none; }
+  th:hover { background: #e5e7eb; }
+  td { padding: 10px 12px; border-top: 1px solid #f3f4f6; vertical-align: top; }
+  tr:hover td { background: #fafbfc; }
+  tr.pinned td { background: #fef9c3; }
+  tr.pinned:hover td { background: #fef3c7; }
+  .code { color: #6b7280; font-size: 12px; font-family: ui-monospace, Menlo, monospace; }
+  .key-risk { max-width: 340px; }
+  .source { font-size: 12px; color: #4b5563; max-width: 220px; }
+  .source a { color: #2563eb; text-decoration: none; display: inline-block; margin-right: 6px; }
+  .source a:hover { text-decoration: underline; }
+  .conf { font-size: 11px; padding: 2px 8px; border-radius: 10px; font-weight: 500; }
+  .conf-High   { background: #d1fae5; color: #065f46; }
+  .conf-Medium { background: #fef3c7; color: #92400e; }
+  .conf-Low    { background: #fee2e2; color: #991b1b; }
+  .pin { color: #be185d; margin-left: 4px; font-size: 12px; }
+  .empty { padding: 30px; text-align: center; color: #6b7280; }
+  .method { font-size: 11px; color: #6b7280; }
+  @media (max-width: 720px) {
+    .key-risk, .source { max-width: none; }
+    input[type=text] { width: 100%; }
+  }
+</style>
+</head>
+<body>
+<h1>Country Energy Risk Feed</h1>
+<div class="sub">
+  <span class="pill ok">{{ rows|length }} countries</span>
+  {% if last_run_status == 'success' %}
+    <span class="pill ok">last run: {{ last_run_status }}</span>
+  {% elif last_run_status == 'running' %}
+    <span class="pill warn">last run: {{ last_run_status }}</span>
+  {% elif last_run_status %}
+    <span class="pill err">last run: {{ last_run_status }}</span>
+  {% endif %}
+  <span class="pill">last refresh: {{ last_refresh or "—" }}</span>
+  <span class="pill">next refresh: {{ next_refresh }}</span>
+</div>
+
+<div class="controls">
+  <input type="text" id="filter" placeholder="Filter by country, code, or risk…" oninput="applyFilter()">
+  <select id="rating-filter" onchange="applyFilter()">
+    <option value="">All ratings</option>
+    <option value="1">1 — Stable</option>
+    <option value="2">2 — Elevated</option>
+    <option value="3">3 — Stressed</option>
+    <option value="4">4 — Severe</option>
+    <option value="5">5 — Critical</option>
+  </select>
+  <span class="legend">
+    <span class="badge r1">1</span><span class="badge r2">2</span><span class="badge r3">3</span><span class="badge r4">4</span><span class="badge r5">5</span>
+  </span>
+  <div class="links">
+    <a href="/api/v1/ratings.json">JSON</a>
+    <a href="/api/v1/ratings.csv">CSV</a>
+    <a href="/api/v1/health">Health</a>
+    <a href="/admin-ui">Admin</a>
+    <a href="/docs">API docs</a>
+  </div>
+</div>
+
+<table id="ratings">
+  <thead>
+    <tr>
+      <th onclick="sortBy('country')">Country</th>
+      <th onclick="sortBy('rating')">Rating</th>
+      <th onclick="sortBy('status')">Status</th>
+      <th onclick="sortBy('oil')">Oil days</th>
+      <th>LNG</th>
+      <th>Hormuz</th>
+      <th class="key-risk">Key risk</th>
+      <th class="source">Source</th>
+      <th>Confidence</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr class="{% if r.is_pinned %}pinned{% endif %}"
+        data-q="{{ (r.country_name ~ ' ' ~ r.country_code ~ ' ' ~ (r.key_risk or '') ~ ' ' ~ (r.region or ''))|lower }}"
+        data-rating="{{ r.rating }}"
+        data-country="{{ r.country_name }}"
+        data-oil="{{ r.oil_reserve_days or 0 }}"
+        data-status="{{ r.status_label }}">
+      <td>
+        <strong>{{ r.country_name }}</strong>
+        <span class="code">{{ r.country_code }}</span>
+        {% if r.is_pinned %}<span class="pin" title="Pinned override">📌</span>{% endif %}
+        <div class="method">{{ r.scoring_method }}</div>
+      </td>
+      <td><span class="badge r{{ r.rating }}">{{ r.rating }}</span></td>
+      <td>{{ r.status_label }}</td>
+      <td>{{ r.oil_reserve_days if r.oil_reserve_days is not none else "—" }}</td>
+      <td>{{ r.lng_status or "—" }}</td>
+      <td>{{ r.hormuz_dependency or "—" }}</td>
+      <td class="key-risk">{{ r.key_risk or "—" }}</td>
+      <td class="source">
+        {{ r.primary_source or "—" }}
+        {% if r.primary_source_url %}
+          <br><a href="{{ r.primary_source_url }}" target="_blank" rel="noopener">primary source ↗</a>
+        {% endif %}
+        {% if r.source_urls %}
+          <br>
+          {% for url in r.source_urls[:3] %}
+            <a href="{{ url }}" target="_blank" rel="noopener">[{{ loop.index }}]</a>
+          {% endfor %}
+          {% if r.source_urls|length > 3 %}<span class="code">+{{ r.source_urls|length - 3 }}</span>{% endif %}
+        {% endif %}
+      </td>
+      <td><span class="conf conf-{{ r.confidence or 'Medium' }}">{{ r.confidence or "—" }}</span></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{% if not rows %}
+<div class="empty">No ratings yet — the first scoring run is still pending. Check back shortly.</div>
+{% endif %}
+
+<script>
+  function applyFilter() {
+    const q = document.getElementById('filter').value.toLowerCase().trim();
+    const rating = document.getElementById('rating-filter').value;
+    document.querySelectorAll('#ratings tbody tr').forEach(tr => {
+      const matchesQ = !q || tr.dataset.q.includes(q);
+      const matchesR = !rating || tr.dataset.rating === rating;
+      tr.style.display = (matchesQ && matchesR) ? '' : 'none';
+    });
+  }
+  let sortDir = {};
+  function sortBy(key) {
+    const map = { country: 'country', rating: 'rating', status: 'status', oil: 'oil' };
+    const attr = 'data-' + map[key];
+    const tbody = document.querySelector('#ratings tbody');
+    const rows = Array.from(tbody.querySelectorAll('tr'));
+    sortDir[key] = !sortDir[key];
+    const dir = sortDir[key] ? 1 : -1;
+    rows.sort((a, b) => {
+      const av = a.getAttribute(attr), bv = b.getAttribute(attr);
+      const an = Number(av), bn = Number(bv);
+      if (!isNaN(an) && !isNaN(bn)) return (an - bn) * dir;
+      return av.localeCompare(bv) * dir;
+    });
+    rows.forEach(r => tbody.appendChild(r));
+  }
+</script>
+</body>
+</html>
