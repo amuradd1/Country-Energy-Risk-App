@@ -106,7 +106,7 @@
     {% for r in rows %}
     <tr class="{% if r.is_pinned %}pinned{% endif %}"
         data-q="{{ (r.country_name ~ ' ' ~ r.country_code ~ ' ' ~ (r.key_risk or '') ~ ' ' ~ (r.region or ''))|lower }}"
-        data-rating="{{ r.rating }}"
+        data-rating="{{ r.energy_risk_rating }}"
         data-country="{{ r.country_name }}"
         data-oil="{{ r.oil_reserve_days or 0 }}"
         data-status="{{ r.status_label }}">
@@ -116,7 +116,7 @@
         {% if r.is_pinned %}<span class="pin" title="Pinned override">📌</span>{% endif %}
         <div class="method">{{ r.scoring_method }}</div>
       </td>
-      <td><span class="badge r{{ r.rating }}">{{ r.rating }}</span></td>
+      <td><span class="badge r{{ r.energy_risk_rating }}">{{ r.energy_risk_rating }}</span></td>
       <td>{{ r.status_label }}</td>
       <td>{{ r.oil_reserve_days if r.oil_reserve_days is not none else "—" }}</td>
       <td>{{ r.lng_status or "—" }}</td>

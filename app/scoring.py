@@ -178,13 +178,36 @@ def _parse_json_array(text: str) -> list[dict[str, Any]]:
     if fence:
         cleaned = fence.group(1)
     else:
-        start, end = cleaned.find("["), cleaned.rfind("]")
-        if start != -1 and end != -1 and end > start:
-            cleaned = cleaned[start : end + 1]
+        # Prefer finding a top-level array. Scan for matching brackets to handle
+        # the case where the model writes preamble prose before/after the array.
+        start = cleaned.find("[")
+        if start != -1:
+            depth = 0
+            end = -1
+            for i in range(start, len(cleaned)):
+                ch = cleaned[i]
+                if ch == "[":
+                    depth += 1
+                elif ch == "]":
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+            if end != -1:
+                cleaned = cleaned[start : end + 1]
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError as e:
-        logger.warning("JSON parse failed: %s", e)
+        logger.warning(
+            "JSON parse failed: %s — raw head=%r tail=%r",
+            e, cleaned[:200], cleaned[-200:] if len(cleaned) > 200 else "",
+        )
+        return []
+    if isinstance(data, dict):
+        # Some models wrap the array in an object. Find the first list value.
+        for v in data.values():
+            if isinstance(v, list):
+                return [d for d in v if isinstance(d, dict)]
         return []
     return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
 
@@ -226,44 +249,64 @@ def _score_batch_with_retry(
     prompt = _build_prompt(today, batch, mode)
 
     last_exc: Optional[Exception] = None
+    codes = [c for c, _ in batch]
     for attempt in range(max_retries):
         try:
+            logger.info(
+                "Scoring batch mode=%s codes=%s attempt=%d", mode, codes, attempt + 1
+            )
             message = client.messages.create(
                 model=settings.anthropic_model,
-                max_tokens=4096,
+                max_tokens=8192,
                 tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
                 messages=[{"role": "user", "content": prompt}],
             )
             text = _extract_text(message)
             search_urls = _extract_search_urls(message)
+            stop_reason = getattr(message, "stop_reason", None)
+            usage = getattr(message, "usage", None)
+            logger.info(
+                "Batch returned: mode=%s codes=%s stop=%s urls=%d text_len=%d usage=%s",
+                mode, codes, stop_reason, len(search_urls), len(text or ""),
+                getattr(usage, "model_dump", lambda: usage)() if usage else None,
+            )
             db.log_scoring(
                 run_id,
                 country_code=None,
                 raw_response=(
-                    f"mode={mode} batch={[c for c, _ in batch]} "
-                    f"attempt={attempt + 1} search_urls={len(search_urls)}\n{text}"
+                    f"mode={mode} batch={codes} attempt={attempt + 1} "
+                    f"stop={stop_reason} urls={len(search_urls)}\n{text}"
                 ),
                 queries=json.dumps([s["url"] for s in search_urls]),
             )
             rows = _parse_json_array(text)
+            if not rows:
+                logger.warning(
+                    "Batch produced no parseable rows: mode=%s codes=%s stop=%s — retrying",
+                    mode, codes, stop_reason,
+                )
+                last_exc = RuntimeError(f"empty/unparseable response (stop={stop_reason})")
+                time.sleep(2 ** attempt)
+                continue
             return rows, search_urls
         except APIError as e:
             last_exc = e
             wait = 2 ** attempt
             logger.warning(
-                "Anthropic API error (attempt %d/%d): %s — retrying in %ds",
-                attempt + 1, max_retries, e, wait,
+                "Anthropic API error (attempt %d/%d) for %s: %s — retrying in %ds",
+                attempt + 1, max_retries, codes, e, wait,
             )
             time.sleep(wait)
         except Exception as e:
             last_exc = e
-            logger.exception("Unexpected error in _score_batch")
+            logger.exception("Unexpected error in _score_batch for %s", codes)
             break
 
+    logger.error("Batch permanently failed: mode=%s codes=%s last_error=%s", mode, codes, last_exc)
     db.log_scoring(
         run_id,
         country_code=None,
-        raw_response=f"API_FAILED mode={mode} batch={[c for c, _ in batch]}: {last_exc}",
+        raw_response=f"API_FAILED mode={mode} batch={codes}: {last_exc}",
         queries=None,
     )
     return [], []
