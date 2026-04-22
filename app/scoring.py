@@ -27,8 +27,8 @@ from .seed import COUNTRIES, EU_BASELINE, EU_COUNTRIES, PREWAVE_DIRECT
 
 logger = logging.getLogger(__name__)
 
-INTER_BATCH_SLEEP_SEC = 15.0
-WEB_SEARCH_MAX_USES = 3
+INTER_BATCH_SLEEP_SEC = 60.0
+WEB_SEARCH_MAX_USES = 1
 
 CONTEXT_DATE_HINT = (
     "The Strait of Hormuz has been effectively closed since February 28, 2026 due to the "
