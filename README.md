@@ -1,6 +1,6 @@
 # Country Energy Risk Feed API
 
-A FastAPI service that serves live country energy risk ratings (1–5 scale) as JSON and CSV. Scores are refreshed daily at 06:00 UTC by an AI engine that uses the Anthropic API with web search. Excel and Power BI connect via Power Query.
+A FastAPI service that serves live country energy risk ratings (1–5 scale) as JSON and CSV. Scores are refreshed weekly on Monday at 06:00 UTC by an AI engine that uses the Anthropic API with web search. Excel and Power BI connect via Power Query.
 
 ## Quick Start
 
@@ -83,7 +83,8 @@ in
 | `ANTHROPIC_API_KEY` | Anthropic API key | required |
 | `ADMIN_API_KEY` | Secret key for admin endpoints | `changeme` |
 | `PORT` | Server port | `8000` |
-| `SCORING_CRON_HOUR` | UTC hour for daily refresh | `6` |
+| `SCORING_CRON_DAY_OF_WEEK` | UTC day for weekly refresh | `mon` |
+| `SCORING_CRON_HOUR` | UTC hour for weekly refresh | `6` |
 | `DATABASE_PATH` | SQLite file path | `energy_risk.db` |
 | `ANTHROPIC_MODEL` | Model used for scoring | `claude-opus-4-7` |
 | `SCORING_BATCH_SIZE` | Countries per API call | `10` |
@@ -94,7 +95,7 @@ in
 2. **Prewave EU Mapped** — 16 EU countries: inherit the EU/Germany baseline (rating 3, Stressed); AI adjusts ±1 based on country-specific energy profile.
 3. **AI Researched** — remaining ~40 countries: full AI web search scoring from scratch.
 
-Each daily run atomically supersedes all previous live ratings (except pinned overrides). Every AI response is stored in the audit log.
+Each weekly run atomically supersedes all previous live ratings (except pinned overrides). Every AI response is stored in the audit log.
 
 ## Anti-Hallucination Safeguards
 
@@ -106,7 +107,7 @@ Hallucination is the single biggest risk with AI scoring, and the scoring engine
 4. **Unverifiable ratings drop to Low confidence.** If the model cannot cite a real URL, the confidence field is automatically capped at Medium or Low.
 5. **Nothing is invented.** The prompt explicitly forbids estimating reserve days, force majeure declarations, or emergency measures that cannot be traced to a cited source.
 6. **Full audit trail.** Every raw AI response + every URL the web search visited is written to `scoring_log`, keyed by `run_id`. Inspect via `GET /admin/log` or the admin UI.
-7. **First-run auto-trigger.** On first deploy (once `ANTHROPIC_API_KEY` is set) the app automatically kicks off the first full AI pass in the background so the feed populates without waiting for 06:00 UTC.
+7. **First-run auto-trigger.** On first deploy (once `ANTHROPIC_API_KEY` is set) the app automatically kicks off the first full AI pass in the background so the feed populates without waiting for the next weekly refresh.
 
 ## Repeatability & Scalability
 

@@ -3,15 +3,15 @@ from __future__ import annotations
 
 import csv
 import io
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from .. import database as db
-from ..config import get_settings
 from ..models import HealthResponse, Metadata, RatingRecord, RatingsResponse
+from ..schedule import get_next_refresh_time
 
 router = APIRouter()
 
@@ -76,13 +76,9 @@ def _to_record(row: dict[str, Any]) -> RatingRecord:
 
 
 def _build_metadata(count: int) -> Metadata:
-    settings = get_settings()
     now = datetime.now(timezone.utc)
     last_run = db.get_last_run()
-    next_refresh = (
-        now.replace(hour=settings.scoring_cron_hour, minute=0, second=0, microsecond=0)
-        + timedelta(days=1)
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    next_refresh = get_next_refresh_time(now=now).strftime("%Y-%m-%dT%H:%M:%SZ")
     return Metadata(
         generated_at=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         methodology=METHODOLOGY,
@@ -150,16 +146,12 @@ def get_rating(country_code: str) -> RatingRecord:
 
 @router.get("/health", response_model=HealthResponse, tags=["public"])
 def health() -> HealthResponse:
-    settings = get_settings()
     live_count = db.count_live_ratings()
     total_countries = len(db.get_all_countries())
     last_run = db.get_last_run()
     last_refresh = db.get_last_successful_run_time()
     now = datetime.now(timezone.utc)
-    next_refresh = (
-        now.replace(hour=settings.scoring_cron_hour, minute=0, second=0, microsecond=0)
-        + timedelta(days=1)
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    next_refresh = get_next_refresh_time(now=now).strftime("%Y-%m-%dT%H:%M:%SZ")
     return HealthResponse(
         status="ok",
         last_refresh=last_refresh,

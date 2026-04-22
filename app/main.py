@@ -35,7 +35,7 @@ def _placeholders_exist() -> bool:
 def _maybe_trigger_first_run() -> None:
     """If the feed still has placeholder rows and an Anthropic key is configured,
     fire the first full AI scoring pass in a background thread so the public
-    feed gets populated without waiting for tomorrow's 06:00 UTC cron."""
+    feed gets populated without waiting for the next weekly cron."""
     global _first_run_started
     settings = get_settings()
     if not settings.anthropic_api_key:
@@ -82,7 +82,7 @@ app = FastAPI(
     title="Country Energy Risk Feed",
     description=(
         "Live country energy risk ratings (1=Stable, 5=Critical). "
-        "Powered by Prewave SITREP data and daily AI-driven web research."
+        "Powered by Prewave SITREP data and weekly AI-driven web research."
     ),
     version="1.1.0",
     lifespan=lifespan,

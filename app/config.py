@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     admin_api_key: str = "changeme"
     port: int = 8000
+    scoring_cron_day_of_week: str = "mon"
     scoring_cron_hour: int = 6
     database_path: str = "energy_risk.db"
     anthropic_model: str = "claude-opus-4-7"

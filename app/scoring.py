@@ -437,7 +437,7 @@ def _chunks(seq: list, n: int) -> list[list]:
 
 
 def run_scoring(trigger_source: str = "scheduler") -> str:
-    """Run a full daily scoring pass. Atomically replaces live ratings on success."""
+    """Run a full scheduled scoring pass. Atomically replaces live ratings on success."""
     settings = get_settings()
     run_id = f"run-{uuid.uuid4().hex[:12]}"
     db.start_run(run_id, trigger_source=trigger_source)
