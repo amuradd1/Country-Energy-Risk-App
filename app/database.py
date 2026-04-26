@@ -1,15 +1,12 @@
 import sqlite3
-import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 
 from .config import get_settings
 
-_lock = threading.Lock()
-
-# Tables only — indexes are created after migrations so we don't try to index
-# columns the migration is about to add.
+# Tables only. Indexes are created after migrations so we do not try to index
+# columns that older databases have not been altered to include yet.
 SCHEMA_TABLES = """
 CREATE TABLE IF NOT EXISTS countries (
     country_code TEXT PRIMARY KEY,
@@ -61,6 +58,10 @@ CREATE TABLE IF NOT EXISTS scoring_log (
     country_code TEXT,
     raw_ai_response TEXT,
     search_queries_used TEXT,
+    verdict TEXT,
+    pass_name TEXT,
+    source_url TEXT,
+    source_tier TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -120,7 +121,9 @@ SCHEMA_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_ratings_live ON risk_ratings(country_code, is_live);
 CREATE INDEX IF NOT EXISTS idx_ratings_run ON risk_ratings(run_id);
 CREATE INDEX IF NOT EXISTS idx_log_run ON scoring_log(run_id);
+CREATE INDEX IF NOT EXISTS idx_log_country ON scoring_log(country_code, created_at);
 CREATE INDEX IF NOT EXISTS idx_rating_changes_country ON rating_changes(country_code);
+CREATE INDEX IF NOT EXISTS idx_rating_changes_run ON rating_changes(run_id);
 CREATE INDEX IF NOT EXISTS idx_evidence_country ON evidence(country_code, field, is_superseded);
 """
 
@@ -152,11 +155,8 @@ def get_conn() -> Iterator[sqlite3.Connection]:
 
 def init_db() -> None:
     with get_conn() as conn:
-        # 1) Create tables (CREATE TABLE IF NOT EXISTS — does nothing if pre-existing).
         conn.executescript(SCHEMA_TABLES)
 
-        # 2) Run column-level migrations BEFORE creating indexes, in case an older
-        #    DB pre-dates a column we'll index on.
         ratings_cols = {r["name"] for r in conn.execute("PRAGMA table_info(risk_ratings)").fetchall()}
         for col, sqltype in [
             ("primary_source_url", "TEXT"),
@@ -194,7 +194,16 @@ def init_db() -> None:
             if col not in countries_cols:
                 conn.execute(f"ALTER TABLE countries ADD COLUMN {col} {sqltype}")
 
-        # 3) Now create indexes — all referenced columns are guaranteed to exist.
+        log_cols = {r["name"] for r in conn.execute("PRAGMA table_info(scoring_log)").fetchall()}
+        for col, sqltype in [
+            ("verdict", "TEXT"),
+            ("pass_name", "TEXT"),
+            ("source_url", "TEXT"),
+            ("source_tier", "TEXT"),
+        ]:
+            if col not in log_cols:
+                conn.execute(f"ALTER TABLE scoring_log ADD COLUMN {col} {sqltype}")
+
         conn.executescript(SCHEMA_INDEXES)
 
 
@@ -212,8 +221,10 @@ def upsert_country(
 ) -> None:
     conn.execute(
         """
-        INSERT INTO countries (country_code, country_name, region, prewave_mapped_to,
-                               is_active, priority_tier, country_group, source_whitelist)
+        INSERT INTO countries (
+            country_code, country_name, region, prewave_mapped_to,
+            is_active, priority_tier, country_group, source_whitelist
+        )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(country_code) DO UPDATE SET
             country_name=excluded.country_name,
@@ -244,8 +255,6 @@ def get_country(code: str) -> Optional[dict[str, Any]]:
         return dict(row) if row else None
 
 
-# ---- Scenarios ----------------------------------------------------------------
-
 def upsert_scenario(
     conn: sqlite3.Connection,
     *,
@@ -260,9 +269,10 @@ def upsert_scenario(
 ) -> None:
     conn.execute(
         """
-        INSERT INTO scenarios (scenario_id, name, description, context_block,
-                               affected_commodities, affected_routes,
-                               started_at, is_active)
+        INSERT INTO scenarios (
+            scenario_id, name, description, context_block,
+            affected_commodities, affected_routes, started_at, is_active
+        )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(scenario_id) DO UPDATE SET
             name=excluded.name,
@@ -272,9 +282,16 @@ def upsert_scenario(
             affected_routes=excluded.affected_routes,
             started_at=excluded.started_at
         """,
-        (scenario_id, name, description, context_block,
-         affected_commodities, affected_routes,
-         started_at or utcnow_iso(), is_active),
+        (
+            scenario_id,
+            name,
+            description,
+            context_block,
+            affected_commodities,
+            affected_routes,
+            started_at or utcnow_iso(),
+            is_active,
+        ),
     )
 
 
@@ -282,10 +299,14 @@ def set_active_scenario(scenario_id: str) -> None:
     with get_conn() as conn:
         conn.execute("BEGIN")
         try:
-            conn.execute("UPDATE scenarios SET is_active = 0, superseded_at = ? WHERE is_active = 1",
-                         (utcnow_iso(),))
-            conn.execute("UPDATE scenarios SET is_active = 1, superseded_at = NULL WHERE scenario_id = ?",
-                         (scenario_id,))
+            conn.execute(
+                "UPDATE scenarios SET is_active = 0, superseded_at = ? WHERE is_active = 1",
+                (utcnow_iso(),),
+            )
+            conn.execute(
+                "UPDATE scenarios SET is_active = 1, superseded_at = NULL WHERE scenario_id = ?",
+                (scenario_id,),
+            )
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -327,38 +348,138 @@ def insert_rating(
     is_pinned: int = 0,
     primary_source_url: Optional[str] = None,
     source_urls: Optional[str] = None,
+    original_baseline_rating: Optional[int] = None,
+    original_baseline_source: Optional[str] = None,
+    last_verified_at: Optional[str] = None,
+    last_checked_at: Optional[str] = None,
+    last_verdict: Optional[str] = None,
+    verifications_count: int = 0,
+    next_full_reassessment_due: Optional[str] = None,
+    scenario_id: Optional[str] = None,
+    primary_source_tier: Optional[str] = None,
 ) -> int:
     status_label = STATUS_LABELS[rating]
     cur = conn.execute(
         """
-        INSERT INTO risk_ratings
-          (country_code, rating, status_label, oil_reserve_days, lng_status, key_risk,
-           primary_source, primary_source_url, secondary_sources, source_urls,
-           confidence, hormuz_dependency, gdp_loss_pct, scoring_method,
-           is_live, is_pinned, run_id, scored_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
+        INSERT INTO risk_ratings (
             country_code, rating, status_label, oil_reserve_days, lng_status, key_risk,
             primary_source, primary_source_url, secondary_sources, source_urls,
             confidence, hormuz_dependency, gdp_loss_pct, scoring_method,
-            is_live, is_pinned, run_id, utcnow_iso(),
+            is_live, is_pinned, run_id, scored_at,
+            original_baseline_rating, original_baseline_source,
+            last_verified_at, last_checked_at, last_verdict, verifications_count,
+            next_full_reassessment_due, scenario_id, primary_source_tier
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            country_code,
+            rating,
+            status_label,
+            oil_reserve_days,
+            lng_status,
+            key_risk,
+            primary_source,
+            primary_source_url,
+            secondary_sources,
+            source_urls,
+            confidence,
+            hormuz_dependency,
+            gdp_loss_pct,
+            scoring_method,
+            is_live,
+            is_pinned,
+            run_id,
+            utcnow_iso(),
+            original_baseline_rating,
+            original_baseline_source,
+            last_verified_at,
+            last_checked_at,
+            last_verdict,
+            verifications_count,
+            next_full_reassessment_due,
+            scenario_id,
+            primary_source_tier,
+        ),
+    )
+    return cur.lastrowid or 0
+
+
+def record_rating_change(
+    conn: sqlite3.Connection,
+    *,
+    country_code: str,
+    from_rating: int,
+    to_rating: int,
+    reason: Optional[str],
+    primary_source_url: Optional[str],
+    primary_source_tier: Optional[str],
+    max_allowed_delta: int,
+    run_id: str,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO rating_changes (
+            country_code, from_rating, to_rating, delta, reason,
+            primary_source_url, primary_source_tier, max_allowed_delta, run_id, changed_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            country_code,
+            from_rating,
+            to_rating,
+            to_rating - from_rating,
+            reason,
+            primary_source_url,
+            primary_source_tier,
+            max_allowed_delta,
+            run_id,
+            utcnow_iso(),
+        ),
+    )
+    return cur.lastrowid or 0
+
+
+def record_evidence(
+    conn: sqlite3.Connection,
+    *,
+    country_code: str,
+    field: str,
+    value: Optional[str],
+    source_url: str,
+    source_date: Optional[str],
+    source_tier: Optional[str],
+    run_id: str,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO evidence (
+            country_code, field, value, source_url, source_date, source_tier,
+            captured_at, run_id, is_superseded
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+        """,
+        (
+            country_code,
+            field,
+            value,
+            source_url,
+            source_date,
+            source_tier,
+            utcnow_iso(),
+            run_id,
         ),
     )
     return cur.lastrowid or 0
 
 
 def get_live_ratings(active_only: bool = True) -> list[dict[str, Any]]:
-    """Return live ratings joined with country metadata.
-
-    By default filters to is_active=1 countries (the priority list).
-    Pass active_only=False from admin endpoints that need full history.
-    """
     with get_conn() as conn:
         sql = """
             SELECT r.*,
                    c.country_name, c.region, c.prewave_mapped_to,
-                   c.is_active, c.priority_tier, c.country_group
+                   c.is_active, c.priority_tier, c.country_group, c.source_whitelist
             FROM risk_ratings r
             JOIN countries c ON c.country_code = r.country_code
             WHERE r.is_live = 1
@@ -376,7 +497,7 @@ def get_live_rating_for(code: str) -> Optional[dict[str, Any]]:
             """
             SELECT r.*,
                    c.country_name, c.region, c.prewave_mapped_to,
-                   c.is_active, c.priority_tier, c.country_group
+                   c.is_active, c.priority_tier, c.country_group, c.source_whitelist
             FROM risk_ratings r
             JOIN countries c ON c.country_code = r.country_code
             WHERE r.is_live = 1 AND r.country_code = ?
@@ -390,7 +511,9 @@ def get_rating_history(code: str) -> list[dict[str, Any]]:
     with get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT r.*, c.country_name
+            SELECT r.*,
+                   c.country_name, c.region, c.prewave_mapped_to,
+                   c.is_active, c.priority_tier, c.country_group, c.source_whitelist
             FROM risk_ratings r
             JOIN countries c ON c.country_code = r.country_code
             WHERE r.country_code = ?
@@ -410,7 +533,6 @@ def get_pinned_codes() -> set[str]:
 
 
 def supersede_live(conn: sqlite3.Connection, keep_pinned: bool = True) -> None:
-    """Mark all current live ratings as superseded. Pinned rows are kept live by default."""
     if keep_pinned:
         conn.execute("UPDATE risk_ratings SET is_live = 0 WHERE is_live = 1 AND is_pinned = 0")
     else:
@@ -442,14 +564,27 @@ def finish_run(run_id: str, status: str, countries_scored: int) -> None:
         )
 
 
-def log_scoring(run_id: str, country_code: Optional[str], raw_response: str, queries: Optional[str] = None) -> None:
+def log_scoring(
+    run_id: str,
+    country_code: Optional[str],
+    raw_response: str,
+    queries: Optional[str] = None,
+    *,
+    verdict: Optional[str] = None,
+    pass_name: Optional[str] = None,
+    source_url: Optional[str] = None,
+    source_tier: Optional[str] = None,
+) -> None:
     with get_conn() as conn:
         conn.execute(
             """
-            INSERT INTO scoring_log (run_id, country_code, raw_ai_response, search_queries_used)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO scoring_log (
+                run_id, country_code, raw_ai_response, search_queries_used,
+                verdict, pass_name, source_url, source_tier
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (run_id, country_code, raw_response, queries),
+            (run_id, country_code, raw_response, queries, verdict, pass_name, source_url, source_tier),
         )
 
 
@@ -457,8 +592,8 @@ def get_log_entries(limit: int = 200) -> list[dict[str, Any]]:
     with get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT l.*, r.status as run_status, r.started_at as run_started_at,
-                   r.finished_at as run_finished_at, r.trigger_source
+            SELECT l.*, r.status AS run_status, r.started_at AS run_started_at,
+                   r.finished_at AS run_finished_at, r.trigger_source
             FROM scoring_log l
             LEFT JOIN runs r ON r.run_id = l.run_id
             ORDER BY l.created_at DESC
@@ -471,9 +606,7 @@ def get_log_entries(limit: int = 200) -> list[dict[str, Any]]:
 
 def get_last_run() -> Optional[dict[str, Any]]:
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM runs ORDER BY started_at DESC LIMIT 1"
-        ).fetchone()
+        row = conn.execute("SELECT * FROM runs ORDER BY started_at DESC LIMIT 1").fetchone()
         return dict(row) if row else None
 
 
@@ -487,5 +620,35 @@ def get_last_successful_run_time() -> Optional[str]:
 
 def count_live_ratings() -> int:
     with get_conn() as conn:
-        row = conn.execute("SELECT COUNT(*) as n FROM risk_ratings WHERE is_live = 1").fetchone()
+        row = conn.execute("SELECT COUNT(*) AS n FROM risk_ratings WHERE is_live = 1").fetchone()
         return int(row["n"]) if row else 0
+
+
+def get_rating_changes_for_run(run_id: str) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT rc.*, c.country_name
+            FROM rating_changes rc
+            JOIN countries c ON c.country_code = rc.country_code
+            WHERE rc.run_id = ?
+            ORDER BY rc.changed_at DESC, c.country_name
+            """,
+            (run_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_recent_rating_changes(limit: int = 100) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT rc.*, c.country_name
+            FROM rating_changes rc
+            JOIN countries c ON c.country_code = rc.country_code
+            ORDER BY rc.changed_at DESC, c.country_name
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
