@@ -139,15 +139,15 @@ def get_ratings_csv() -> StreamingResponse:
 def get_rating(country_code: str) -> RatingRecord:
     code = country_code.upper()
     row = db.get_live_rating_for(code)
-    if row is None:
+    if row is None or not row.get("is_active", 1):
         raise HTTPException(status_code=404, detail=f"No live rating found for country code '{code}'")
     return _to_record(row)
 
 
 @router.get("/health", response_model=HealthResponse, tags=["public"])
 def health() -> HealthResponse:
-    live_count = db.count_live_ratings()
-    total_countries = len(db.get_all_countries())
+    live_count = len(db.get_live_ratings(active_only=True))
+    total_countries = len(db.get_all_countries(active_only=True))
     last_run = db.get_last_run()
     last_refresh = db.get_last_successful_run_time()
     now = datetime.now(timezone.utc)
