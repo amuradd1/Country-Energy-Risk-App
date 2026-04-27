@@ -28,16 +28,29 @@ INTER_CALL_SLEEP_SEC = 60.0
 WEB_SEARCH_MAX_USES = 1
 CHALLENGER_LOOKBACK_DAYS = 14
 PASS_TWO_LOOKBACK_DAYS = 30
+FULL_REASSESSMENT_LOOKBACK_DAYS = 90  # baselining uses authoritative sources that may be older
 
 ALLOWED_CHALLENGER_VERDICTS = {"no_change", "insufficient_evidence", "change"}
+# Tiers we'll *accept* as a valid result. Untrusted/structural URLs flow through
+# with Low/Medium confidence rather than being thrown out — the model's pick
+# being in the search results IS the evidence that the URL is real and relevant.
 ACCEPTED_SOURCE_TIERS = {
     "tier1_authority",
     "government_regulator",
     "country_whitelist",
+    "country_inferred",
     "tier2_global",
+    "structural_authority",
+    "untrusted",
 }
 STRONG_DELTA_TIERS = {"tier1_authority", "government_regulator"}
 HIGH_CONFIDENCE_TIERS = {"tier1_authority", "government_regulator", "country_whitelist"}
+
+# Country-code-top-level-domain map — most countries match their ISO-2 lowercase,
+# but a few (UK, Korea-as-Republic-of) need explicit overrides.
+COUNTRY_CCTLDS: dict[str, list[str]] = {
+    "GB": ["uk", "co.uk", "gov.uk", "org.uk", "ac.uk", "gb"],
+}
 
 TIER1_AUTHORITY_DOMAINS = {
     "iea.org",
@@ -202,7 +215,24 @@ def _normalize_hormuz(value: Any, fallback: Optional[str] = None) -> Optional[st
     return fallback
 
 
-def _classify_source_tier(url: Optional[str], whitelist: list[str]) -> Optional[str]:
+def _country_tld_match(domain: Optional[str], country_code: Optional[str]) -> bool:
+    """True when the URL's TLD matches the country's ccTLD pattern.
+
+    e.g. aggm.at for AT, brazilenergyinsight.com.br for BR, gov.uk for GB.
+    Catches authoritative country-domain sources that aren't on the whitelist
+    yet (the most common rejection in production logs)."""
+    if not domain or not country_code:
+        return False
+    overrides = COUNTRY_CCTLDS.get(country_code.upper())
+    candidates = overrides if overrides else [country_code.lower()]
+    return any(domain == c or domain.endswith(f".{c}") for c in candidates)
+
+
+def _classify_source_tier(
+    url: Optional[str],
+    whitelist: list[str],
+    country_code: Optional[str] = None,
+) -> Optional[str]:
     domain = _domain_from_url(url)
     if not domain:
         return None
@@ -212,6 +242,8 @@ def _classify_source_tier(url: Optional[str], whitelist: list[str]) -> Optional[
         return "government_regulator"
     if any(_domain_matches(domain, candidate) for candidate in whitelist):
         return "country_whitelist"
+    if _country_tld_match(domain, country_code):
+        return "country_inferred"
     if any(_domain_matches(domain, candidate) for candidate in TIER2_GLOBAL_DOMAINS):
         return "tier2_global"
     if any(_domain_matches(domain, candidate) for candidate in STRUCTURAL_AUTHORITY_DOMAINS):
@@ -247,6 +279,8 @@ def _min_confidence(a: Optional[str], b: Optional[str]) -> str:
 def _confidence_from_source_tier(source_tier: Optional[str]) -> str:
     if source_tier in HIGH_CONFIDENCE_TIERS:
         return "High"
+    if source_tier == "country_inferred":
+        return "Medium"
     if source_tier == "tier2_global":
         return "Medium"
     if source_tier == "structural_authority":
@@ -774,17 +808,21 @@ def _apply_challenger_response(
     allowed_urls = {item["url"] for item in search_urls}
     titles_by_url = _search_title_map(search_urls)
     whitelist = _split_csv(country.get("source_whitelist"))
+    country_code = country["country_code"]
 
     primary_url = _validate_url(_clean_text(raw.get("primary_source_url"), limit=500), allowed_urls)
-    primary_tier = _classify_source_tier(primary_url, whitelist)
+    primary_tier = _classify_source_tier(primary_url, whitelist, country_code)
     primary_date = _parse_source_date(raw.get("primary_source_date"))
 
     secondary_url = _validate_url(_clean_text(raw.get("secondary_source_url"), limit=500), allowed_urls)
-    secondary_tier = _classify_source_tier(secondary_url, whitelist)
+    secondary_tier = _classify_source_tier(secondary_url, whitelist, country_code)
     secondary_date = _parse_source_date(raw.get("secondary_source_date"))
 
-    source_ok = primary_url is not None and primary_tier in ACCEPTED_SOURCE_TIERS and _is_fresh(primary_date, now, CHALLENGER_LOOKBACK_DAYS)
-    fresh_secondary = secondary_url is not None and secondary_tier in ACCEPTED_SOURCE_TIERS and _is_fresh(secondary_date, now, CHALLENGER_LOOKBACK_DAYS)
+    # Acceptance: URL must be real (in search results) and fresh. Tier becomes
+    # confidence labeling, not a verdict gate — the model's pick being in the
+    # actual search results is the evidence the URL is relevant.
+    source_ok = primary_url is not None and _is_fresh(primary_date, now, CHALLENGER_LOOKBACK_DAYS)
+    fresh_secondary = secondary_url is not None and _is_fresh(secondary_date, now, CHALLENGER_LOOKBACK_DAYS)
 
     if verdict == "insufficient_evidence" or not source_ok:
         result = _build_hold_result(
@@ -974,11 +1012,16 @@ def _apply_full_reassessment(
     allowed_urls = {item["url"] for item in search_urls}
     titles_by_url = _search_title_map(search_urls)
     whitelist = _split_csv(country.get("source_whitelist"))
+    country_code = country["country_code"]
 
     primary_url = _validate_url(_clean_text(raw.get("primary_source_url"), limit=500), allowed_urls)
-    primary_tier = _classify_source_tier(primary_url, whitelist)
+    primary_tier = _classify_source_tier(primary_url, whitelist, country_code)
     primary_date = _parse_source_date(raw.get("primary_source_date"))
-    if primary_url is None or primary_tier not in ACCEPTED_SOURCE_TIERS or not _is_fresh(primary_date, now, PASS_TWO_LOOKBACK_DAYS):
+    # For baselining we accept any tier (confidence reflects it). Hold only if
+    # URL is missing/fabricated or the article predates our lenient 90-day
+    # baselining window — country profiles, ministry annual reports, etc. are
+    # legitimately older than 30 days.
+    if primary_url is None or not _is_fresh(primary_date, now, FULL_REASSESSMENT_LOOKBACK_DAYS):
         result = _build_hold_result(
             current=current,
             verdict="insufficient_evidence",
