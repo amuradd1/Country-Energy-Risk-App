@@ -1,6 +1,7 @@
 """Admin API endpoints — protected by X-Admin-Key header."""
 from __future__ import annotations
 
+import logging
 import threading
 import uuid
 from typing import Any
@@ -17,6 +18,8 @@ from ..models import (
     TriggerResponse,
     UnpinRequest,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -96,17 +99,40 @@ def unpin_country(
 def trigger_refresh(
     _auth: None = Depends(_require_admin),
 ) -> TriggerResponse:
+    """Fire-and-forget scoring run. Returns immediately; the actual work
+    happens in a daemon thread so Railway's edge proxy doesn't 502 us out
+    on long runs (a 43-country full reassessment can take ~60 minutes)."""
     if not _run_lock.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail="A scoring run is already in progress")
-    try:
-        from ..scoring import run_scoring  # lazy import
+        raise HTTPException(
+            status_code=409,
+            detail="A scoring run is already in progress; check /admin/runs",
+        )
 
-        run_id = run_scoring(trigger_source="admin_trigger")
-        return TriggerResponse(ok=True, run_id=run_id, message="Scoring run completed successfully")
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Scoring run failed: {exc}") from exc
-    finally:
-        _run_lock.release()
+    def _run_in_background() -> None:
+        try:
+            from ..scoring import run_scoring  # lazy import avoids import cycle
+            rid = run_scoring(trigger_source="admin_trigger")
+            logger.info("Manual scoring run completed: %s", rid)
+        except Exception:
+            logger.exception("Manual scoring run failed in background")
+        finally:
+            _run_lock.release()
+
+    threading.Thread(
+        target=_run_in_background,
+        daemon=True,
+        name="manual-scoring-run",
+    ).start()
+
+    return TriggerResponse(
+        ok=True,
+        run_id="started",
+        message=(
+            "Scoring run started in the background. First-run full reassessment of "
+            "43 countries takes ~60 minutes; subsequent weekly challenger runs are "
+            "shorter. Poll /admin/runs or /api/v1/health for completion."
+        ),
+    )
 
 
 @router.get("/log", tags=["admin"])

@@ -47,9 +47,10 @@
 
 <div class="card">
   <h2>Trigger scoring run now</h2>
-  <p style="font-size:13px; color:#4b5563;">Runs the full AI pass immediately. Takes several minutes — all live (non-pinned) ratings are atomically replaced on success.</p>
+  <p style="font-size:13px; color:#4b5563;">Kicks off a scoring run in the background and returns immediately. First-run full reassessment of 43 countries takes ~60 min; subsequent challenger runs are shorter. Use "Check runs" to see progress.</p>
   <button onclick="triggerRefresh()">Run now</button>
   <button class="secondary" onclick="loadHealth()">Check health</button>
+  <button class="secondary" onclick="loadRuns()">Check runs</button>
   <pre class="out" id="refresh-out" style="display:none;"></pre>
 </div>
 
@@ -110,7 +111,7 @@
     return `HTTP ${res.status}\n\n${body}`;
   }
   async function triggerRefresh() {
-    show('refresh-out', 'Running — this may take several minutes…');
+    show('refresh-out', 'Starting run in background…');
     show('refresh-out', await req('/admin/trigger-refresh', { method: 'POST' }));
   }
   async function loadHealth() {
